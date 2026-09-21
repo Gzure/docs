@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""模板数据的跨库导出 / 导入 / 删除检查。
+
+场景：在 A 机器（PostgreSQL 版本）上构建好模板，把模板在数据库里的全部记录搬到
+B 机器（MySQL 版本），两边的 team_id 可以不同。
+
+只搬数据库记录。模板本体（rootfs / memfile / snapshot 文件）在对象存储里，
+需要另外同步；两边的 build_id 保持不变，所以存储里的路径不用改。
+
+涉及的表（按外键顺序）：
+    envs                    模板本体
+    env_builds              构建记录（存储路径按 build_id 组织）
+    env_build_assignments   tag -> build 的映射
+    env_aliases             别名（namespace 是团队 slug，换团队时必须改写）
+    snapshot_templates      仅当模板由沙箱快照生成时存在
+
+不导出 snapshots 表：那是沙箱的暂停状态，跟着沙箱走，不属于模板。
+
+用法：
+    # 在 PostgreSQL 机器上导出
+    template-migrate.py export --template-id <模板ID> --out tpl.json \
+        --pg-host 10.0.0.1 --pg-db e2b --pg-user postgres
+
+    # 在 MySQL 机器上导入，可换团队
+    template-migrate.py import --in tpl.json --team-id <目标团队ID> \
+        --host 10.0.0.5 --db agentic_bidding --user e2b
+
+    # 检查模板是否从数据库里删干净了
+    template-migrate.py check-deleted --template-id <模板ID> \
+        --host 10.0.0.5 --db agentic_bidding --user e2b
+
+密码通过环境变量传：导出用 PGPASSWORD，导入和检查用 MYSQL_PWD。
+依赖：Python 3.8+（只用标准库）、psql（导出端）、mysql（导入端）。
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+# 按外键依赖排序，导入时按这个顺序插，删除时倒着来
+TABLES = [
+    "envs",
+    "env_builds",
+    "env_build_assignments",
+    "env_aliases",
+    "snapshot_templates",
+]
+
+# 每张表用哪一列关联到模板
+TEMPLATE_KEY = {
+    "envs": "id",
+    "env_builds": "env_id",
+    "env_build_assignments": "env_id",
+    "env_aliases": "env_id",
+    "snapshot_templates": "env_id",
+}
+
+# MySQL 里是生成列，不能显式插入（PostgreSQL 版本里是触发器维护的普通列）
+GENERATED_COLUMNS = {"env_builds": {"status_group"}}
+
+# 带 team_id 的表，导入时按 --team-id 改写
+TEAM_COLUMNS = {"envs": "team_id", "env_builds": "team_id"}
+
+
+def die(msg):
+    print(f"错误：{msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- 数据库访问
+
+
+def psql(args, sql, want_output=True):
+    # PSQL_CMD 允许把客户端换成容器里的 psql，例如：
+    #   PSQL_CMD="docker exec -i postgres psql"
+    base = os.environ.get("PSQL_CMD", "psql").split()
+    cmd = base + [
+        "-h", args.pg_host, "-p", str(args.pg_port),
+        "-U", args.pg_user, "-d", args.pg_db,
+        "-tAq", "-v", "ON_ERROR_STOP=1",
+    ]
+    proc = subprocess.run(cmd + ["-c", sql], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"psql 执行失败：\n{proc.stderr.strip()}")
+    return proc.stdout.strip() if want_output else ""
+
+
+def mysql(args, sql, want_output=True, raw=False):
+    # MYSQL_CMD 同理，例如：
+    #   MYSQL_CMD="docker run --rm -i --network host -e MYSQL_PWD mysql:8.4.3 mysql"
+    base = os.environ.get("MYSQL_CMD", "mysql").split()
+    cmd = base + [
+        "-h", args.host, "-P", str(args.port), "-u", args.user,
+        "--default-character-set=utf8mb4",
+    ]
+    if not raw:
+        cmd += ["-N", "-B"]
+    cmd += [args.db]
+    proc = subprocess.run(cmd, input=sql, capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"mysql 执行失败：\n{proc.stderr.strip()}")
+    if proc.stderr.strip() and "insecure" not in proc.stderr:
+        print(proc.stderr.strip(), file=sys.stderr)
+    return proc.stdout.rstrip("\n") if want_output else ""
+
+
+# ---------------------------------------------------------------- 导出
+
+
+def cmd_export(args):
+    tpl = args.template_id
+
+    # 模板必须存在，否则后面导出的全是空表，容易被误当成成功
+    exists = psql(args, f"SELECT count(*) FROM envs WHERE id = {pg_lit(tpl)}")
+    if exists != "1":
+        die(f"源库里找不到模板 {tpl}")
+
+    meta_row = psql(args, f"""
+        SELECT json_build_object(
+            'team_id', e.team_id::text,
+            'team_slug', t.slug,
+            'source', e.source,
+            'deleted_at', e.deleted_at
+        )
+        FROM envs e JOIN teams t ON t.id = e.team_id
+        WHERE e.id = {pg_lit(tpl)}""")
+    meta = json.loads(meta_row)
+
+    if meta.get("deleted_at"):
+        print(f"警告：模板 {tpl} 在源库里已软删除（deleted_at={meta['deleted_at']}）",
+              file=sys.stderr)
+
+    data = {}
+    for table in TABLES:
+        key = TEMPLATE_KEY[table]
+        rows_json = psql(args, f"""
+            SELECT coalesce(json_agg(row_to_json(t)), '[]'::json)
+            FROM (SELECT * FROM {table} WHERE {key} = {pg_lit(tpl)}) t""")
+        rows = json.loads(rows_json)
+        # 生成列不导出，避免导入端报 "generated column cannot be inserted"
+        for row in rows:
+            for col in GENERATED_COLUMNS.get(table, ()):
+                row.pop(col, None)
+        data[table] = rows
+        print(f"  {table:<24} {len(rows)} 行")
+
+    if not data["env_builds"]:
+        print("警告：这个模板没有任何构建记录，导入后无法启动沙箱", file=sys.stderr)
+
+    payload = {
+        "meta": {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "source_engine": "postgres",
+            "template_id": tpl,
+            "team_id": meta["team_id"],
+            "team_slug": meta["team_slug"],
+            "env_source": meta["source"],
+        },
+        "tables": data,
+    }
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+
+    print(f"\n已导出到 {args.out}")
+    print(f"  模板 {tpl}    团队 {meta['team_id']} (slug={meta['team_slug']})")
+    build_ids = [b["id"] for b in data["env_builds"]]
+    if build_ids:
+        print("  存储里需要一并同步的 build_id：")
+        for b in build_ids:
+            print(f"    {b}")
+
+
+def pg_lit(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+# ---------------------------------------------------------------- 导入
+
+
+def mysql_lit(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+    s = str(value)
+    s = (s.replace("\\", "\\\\").replace("'", "\\'")
+          .replace("\n", "\\n").replace("\r", "\\r").replace("\x00", ""))
+    return "'" + s + "'"
+
+
+ISO_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?)"
+    r"(Z|[+-]\d{2}(?::?\d{2})?)?$")
+
+
+def to_mysql_datetime(value):
+    """PostgreSQL 的 timestamptz 转成 MySQL DATETIME(6) 要的 UTC 字面量。
+
+    表里存的是不带时区的 UTC 时间（连接层强制 time_zone='+00:00'），
+    所以带时区的值要先归一到 UTC 再去掉时区后缀。
+    """
+    if not isinstance(value, str):
+        return value
+    m = ISO_RE.match(value.strip())
+    if not m:
+        return value
+    date_part, time_part, tz = m.groups()
+    if tz and tz != "Z":
+        tz_norm = tz if ":" in tz[1:] else f"{tz[:3]}:{tz[3:]}" if len(tz) == 5 else tz
+        try:
+            dt = datetime.fromisoformat(f"{date_part}T{time_part}{tz_norm}")
+            dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            pass
+    return f"{date_part} {time_part}"
+
+
+def target_columns(args, table):
+    out = mysql(args, f"""
+        SELECT column_name, data_type, extra FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = '{table}'""")
+    cols = {}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        name, dtype, extra = (line.split("\t") + ["", ""])[:3]
+        # 只有 "STORED GENERATED" / "VIRTUAL GENERATED" 才是真正的生成列，不能插入。
+        # 带表达式默认值的普通列（UUID()、CURRENT_TIMESTAMP(6)、JSON_OBJECT()）
+        # 在 extra 里是 "DEFAULT_GENERATED"，必须照常插入，否则会被默认值覆盖，
+        # 导致 build_id 变成新 UUID、created_at 变成导入时间。
+        extra_up = (extra or "").upper()
+        generated = "STORED GENERATED" in extra_up or "VIRTUAL GENERATED" in extra_up
+        cols[name] = {"type": dtype, "generated": generated}
+    return cols
+
+
+def cmd_import(args):
+    with open(args.infile, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    meta = payload["meta"]
+    tables = payload["tables"]
+    tpl = meta["template_id"]
+    src_team = meta.get("team_id")
+
+    print(f"导入模板 {tpl}")
+    print(f"  源团队 {src_team} (slug={meta.get('team_slug')})")
+
+    # 目标团队：没给就沿用源团队
+    team_id = args.team_id or src_team
+    row = mysql(args, f"SELECT id, slug FROM teams WHERE id = {mysql_lit(team_id)}")
+    if not row.strip():
+        die(f"目标库里没有团队 {team_id}，请先确认 team_id，或用 seed-db 创建团队")
+    team_slug = row.split("\t")[1]
+    print(f"  目标团队 {team_id} (slug={team_slug})")
+
+    existing = mysql(args, f"SELECT count(*) FROM envs WHERE id = {mysql_lit(tpl)}")
+    if existing != "0":
+        if not args.replace:
+            die(f"目标库里已存在模板 {tpl}；确认要覆盖请加 --replace")
+        print(f"  --replace：先删除已存在的 {tpl}")
+        purge_template(args, tpl)
+
+    # 默认保持外键检查开启：插入顺序已按依赖排好，开着能第一时间发现数据不完整
+    # （比如 build_id 对不上），关掉只会把问题留到运行期。
+    stmts = ["SET time_zone = '+00:00';"]
+    if args.no_fk_checks:
+        stmts.append("SET FOREIGN_KEY_CHECKS = 0;")
+    stmts.append("START TRANSACTION;")
+
+    total = 0
+    for table in TABLES:
+        rows = tables.get(table, [])
+        if not rows:
+            continue
+        tcols = target_columns(args, table)
+        if not tcols:
+            die(f"目标库里没有表 {table}，请先执行数据库迁移")
+
+        dropped, inserted = set(), 0
+        for row in rows:
+            cols, vals = [], []
+            for col, value in row.items():
+                if col not in tcols:
+                    dropped.add(col)
+                    continue
+                if tcols[col]["generated"]:
+                    continue
+                # team_id 改写
+                if TEAM_COLUMNS.get(table) == col and value is not None:
+                    value = team_id
+                # 别名的 namespace 就是团队 slug，换团队必须一起换，
+                # 否则 API 按 (alias, 当前团队 slug) 查不到这个别名
+                if table == "env_aliases" and col == "namespace" and value is not None:
+                    value = team_slug
+                if args.clear_created_by and table == "envs" and col == "created_by":
+                    value = None
+                if args.clear_cluster and table == "envs" and col == "cluster_id":
+                    value = None
+                if tcols[col]["type"] in ("datetime", "timestamp") and value is not None:
+                    value = to_mysql_datetime(value)
+                cols.append(f"`{col}`")
+                vals.append(mysql_lit(value))
+            stmts.append(
+                f"INSERT INTO `{table}` ({', '.join(cols)}) VALUES ({', '.join(vals)});")
+            inserted += 1
+        total += inserted
+        note = f"  （目标库没有这些列，已跳过：{', '.join(sorted(dropped))}）" if dropped else ""
+        print(f"  {table:<24} {inserted} 行{note}")
+
+    stmts.append("COMMIT;")
+    if args.no_fk_checks:
+        stmts.append("SET FOREIGN_KEY_CHECKS = 1;")
+
+    if args.dry_run:
+        print("\n--- dry-run，以下 SQL 不会执行 ---")
+        print("\n".join(stmts))
+        return
+
+    mysql(args, "\n".join(stmts), want_output=False)
+    print(f"\n导入完成，共 {total} 行")
+    verify_import(args, tpl, team_id)
+
+
+def purge_template(args, tpl):
+    """按外键倒序物理删除一个模板的全部记录（env_builds 没有外键，必须显式删）。"""
+    lit = mysql_lit(tpl)
+    mysql(args, f"""
+SET FOREIGN_KEY_CHECKS = 0;
+START TRANSACTION;
+DELETE FROM snapshot_templates WHERE env_id = {lit};
+DELETE FROM env_aliases WHERE env_id = {lit};
+DELETE FROM env_build_assignments WHERE env_id = {lit};
+DELETE FROM env_builds WHERE env_id = {lit};
+DELETE FROM envs WHERE id = {lit};
+COMMIT;
+SET FOREIGN_KEY_CHECKS = 1;""", want_output=False)
+
+
+def verify_import(args, tpl, team_id):
+    lit = mysql_lit(tpl)
+    out = mysql(args, f"""
+SELECT 'envs', count(*) FROM envs WHERE id = {lit}
+UNION ALL SELECT 'env_builds', count(*) FROM env_builds WHERE env_id = {lit}
+UNION ALL SELECT 'env_build_assignments', count(*) FROM env_build_assignments WHERE env_id = {lit}
+UNION ALL SELECT 'env_aliases', count(*) FROM env_aliases WHERE env_id = {lit}
+UNION ALL SELECT 'snapshot_templates', count(*) FROM snapshot_templates WHERE env_id = {lit}
+UNION ALL SELECT 'ready_builds', count(*) FROM env_builds
+    WHERE env_id = {lit} AND status_group = 'ready'
+UNION ALL SELECT 'team_matches', count(*) FROM envs
+    WHERE id = {lit} AND team_id = {mysql_lit(team_id)};""")
+    print("\n导入结果：")
+    ready = None
+    for line in out.splitlines():
+        name, cnt = line.split("\t")
+        print(f"  {name:<24} {cnt}")
+        if name == "ready_builds":
+            ready = cnt
+    if ready == "0":
+        print("\n警告：没有状态为 ready 的构建，API 会认为这个模板不可用。",
+              file=sys.stderr)
+
+
+# ---------------------------------------------------------------- 删除检查
+
+
+def cmd_check_deleted(args):
+    lit = mysql_lit(args.template_id)
+    print(f"检查模板 {args.template_id} 在数据库里的残留\n")
+
+    out = mysql(args, f"""
+SELECT 'envs（存在即未物理删除）', count(*) FROM envs WHERE id = {lit}
+UNION ALL SELECT 'envs 已软删除', count(*) FROM envs WHERE id = {lit} AND deleted_at IS NOT NULL
+UNION ALL SELECT 'env_builds', count(*) FROM env_builds WHERE env_id = {lit}
+UNION ALL SELECT 'env_build_assignments', count(*) FROM env_build_assignments WHERE env_id = {lit}
+UNION ALL SELECT 'env_aliases', count(*) FROM env_aliases WHERE env_id = {lit}
+UNION ALL SELECT 'snapshot_templates', count(*) FROM snapshot_templates WHERE env_id = {lit}
+UNION ALL SELECT 'snapshots.env_id', count(*) FROM snapshots WHERE env_id = {lit}
+UNION ALL SELECT 'snapshots.base_env_id', count(*) FROM snapshots WHERE base_env_id = {lit};""")
+
+    counts = {}
+    for line in out.splitlines():
+        name, cnt = line.split("\t")
+        counts[name] = int(cnt)
+        print(f"  {name:<34} {cnt}")
+
+    env_rows = counts.get("envs（存在即未物理删除）", 0)
+    soft = counts.get("envs 已软删除", 0)
+    residue = sum(v for k, v in counts.items()
+                  if k not in ("envs（存在即未物理删除）", "envs 已软删除"))
+
+    print()
+    if env_rows == 0:
+        if residue == 0:
+            print("结论：已彻底删除，没有任何残留。")
+        else:
+            print("结论：envs 已删除，但其它表还有残留——这些是孤儿数据。")
+            print("      env_builds 没有指向 envs 的外键，不会被级联删除，需要手工清理。")
+    elif soft:
+        print("结论：模板是软删除（deleted_at 已设置），记录仍在库里。")
+        print("      这是应用层删除模板的正常行为：别名被删除，构建记录保留。")
+    else:
+        print("结论：模板仍然存在，没有被删除。")
+
+    if args.orphans:
+        check_orphans(args)
+
+
+def check_orphans(args):
+    print("\n全库孤儿扫描：")
+    out = mysql(args, """
+SELECT 'env_builds 指向不存在的模板', count(*) FROM env_builds b
+    LEFT JOIN envs e ON e.id = b.env_id
+    WHERE b.env_id IS NOT NULL AND e.id IS NULL
+UNION ALL SELECT 'env_builds 没有 env_id', count(*) FROM env_builds WHERE env_id IS NULL
+UNION ALL SELECT 'env_build_assignments 指向不存在的构建', count(*) FROM env_build_assignments a
+    LEFT JOIN env_builds b ON b.id = a.build_id WHERE b.id IS NULL
+UNION ALL SELECT 'env_aliases 指向不存在的模板', count(*) FROM env_aliases al
+    LEFT JOIN envs e ON e.id = al.env_id WHERE e.id IS NULL
+UNION ALL SELECT 'snapshot_templates 指向不存在的模板', count(*) FROM snapshot_templates st
+    LEFT JOIN envs e ON e.id = st.env_id WHERE e.id IS NULL
+UNION ALL SELECT '软删除但仍有别名的模板', count(*) FROM envs e
+    JOIN env_aliases al ON al.env_id = e.id WHERE e.deleted_at IS NOT NULL;""")
+    total = 0
+    for line in out.splitlines():
+        name, cnt = line.split("\t")
+        total += int(cnt)
+        flag = "  <== 需要清理" if int(cnt) else ""
+        print(f"  {name:<44} {cnt}{flag}")
+    if total == 0:
+        print("\n  全库没有孤儿数据。")
+    else:
+        print(f"\n  共 {total} 条孤儿数据。清理孤儿构建记录："
+              "\n    DELETE b FROM env_builds b LEFT JOIN envs e ON e.id = b.env_id"
+              "\n     WHERE b.env_id IS NOT NULL AND e.id IS NULL;")
+
+
+# ---------------------------------------------------------------- 入口
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="模板数据的跨库导出 / 导入 / 删除检查",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_mysql_opts(sp):
+        sp.add_argument("--host", default=os.environ.get("DB_HOST", "127.0.0.1"))
+        sp.add_argument("--port", default=os.environ.get("DB_PORT", "3306"))
+        sp.add_argument("--db", default=os.environ.get("DB_NAME"), required=not os.environ.get("DB_NAME"))
+        sp.add_argument("--user", default=os.environ.get("DB_USER", "root"))
+
+    e = sub.add_parser("export", help="从 PostgreSQL 导出一个模板")
+    e.add_argument("--template-id", required=True)
+    e.add_argument("--out", required=True)
+    e.add_argument("--pg-host", default=os.environ.get("PGHOST", "127.0.0.1"))
+    e.add_argument("--pg-port", default=os.environ.get("PGPORT", "5432"))
+    e.add_argument("--pg-db", default=os.environ.get("PGDATABASE", "postgres"))
+    e.add_argument("--pg-user", default=os.environ.get("PGUSER", "postgres"))
+    e.set_defaults(func=cmd_export)
+
+    i = sub.add_parser("import", help="把导出的模板导入 MySQL")
+    i.add_argument("--in", dest="infile", required=True)
+    i.add_argument("--team-id", help="目标团队 ID，不给则沿用导出时的 team_id")
+    i.add_argument("--replace", action="store_true", help="目标库已有同名模板时先删除")
+    i.add_argument("--dry-run", action="store_true", help="只打印 SQL，不执行")
+    i.add_argument("--no-fk-checks", action="store_true",
+                   help="导入期间关闭外键检查（默认开启，用于及早发现数据不完整）")
+    i.add_argument("--keep-created-by", dest="clear_created_by",
+                   action="store_false", default=True,
+                   help="保留 envs.created_by（默认置空，因为目标库多半没有这个用户）")
+    i.add_argument("--keep-cluster", dest="clear_cluster",
+                   action="store_false", default=True,
+                   help="保留 envs.cluster_id（默认置空）")
+    add_mysql_opts(i)
+    i.set_defaults(func=cmd_import)
+
+    c = sub.add_parser("check-deleted", help="检查模板是否从数据库里删干净")
+    c.add_argument("--template-id", required=True)
+    c.add_argument("--orphans", action="store_true", help="同时做一次全库孤儿扫描")
+    add_mysql_opts(c)
+    c.set_defaults(func=cmd_check_deleted)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
