@@ -1,0 +1,187 @@
+客户环境账号
+ext.lihuafei1
+uKonw3in8gxs_1
+
+ext.xiajingze1
+Huawei12#$
+
+登录堡垒机
+ssh ext.xiajingze1@bastion.jd.com
+
+Podip:
+6.176.76.128
+6.176.76.129
+root
+OGIzYzgyMjExM2I5MTUyNjljMWEyN2Uz
+
+
+JD内部go源
+http://artifactory.jd.com/artifactory/api/go/go_virtual
+
+
+容器镜像：
+other-jd-openeuler24.03lts:
+
+redis测试命令：
+redis-cli -h ap2.jd.local -p 5360 -a 'jim://3045132206070481179/6650' ping
+
+Mysql创建表命令：
+export DB_HOST=mysql-cn-north-1-0d172e202dfb4050.rds.jdcloud.com
+export DB_NAME=agentic_bidding 
+export DB_USER=ads_model_agent
+export DB_PASSWORD='NzdlZmMxZGE3MGY0YTkwZTc4ZDA5Zjdm'
+export MIGRATOR_BIN=/home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/migrator
+export MIGRATIONS_DIR=/home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/migrations
+./run-migrations.sh up
+
+Mysql确认库已创建命令：
+mysql -h mysql-cn-north-1-0d172e202dfb4050.rds.jdcloud.com -P 3306 -u ads_model_agent -p --table -e "SELECT VERSION() AS ver, CURRENT_USER() AS matched_account, USER() AS connected_as; SHOW GRANTS; SHOW DATABASES;"
+
+seed-db生成凭证命令（注意邮箱 admin@e2b.dev 会影响teamsid生成）：
+export POSTGRES_CONNECTION_STRING='ads_model_agent:NzdlZmMxZGE3MGY0YTkwZTc4ZDA5Zjdm@tcp(mysql-cn-north-1-0d172e202dfb4050.rds.jdcloud.com:3306)/agentic_bidding'
+chmod +x ./seed-db
+printf '%s\n' 'admin@e2b.dev' | ./seed-db | tee user.txt
+
+生成的凭证信息：
+Please enter the following values:
+Email:
+Seeding database with:
+  Email: admin@e2b.dev
+  Team ID: 81e81bf9-151f-475c-b684-f4d84ab212e6
+  Access Token: sk_e2b_604b598a2270812e30b1b17ae443ee25db5e4022
+  Team API Key: e2b_03ec1657fe0514e9a457200acf1cdcbde0bd36eb
+
+Database seeded.
+
+在旧容器内到处postgresql模板数据：
+./template-migrate.py export --template-id r0zjp61psosxt27uo221 --out tpl.json --pg-host 6.176.76.128 --pg-db mydatabase --pg-user postgres
+
+在新容器内导入mysql模板数据：
+export MYSQL_PWD=NzdlZmMxZGE3MGY0YTkwZTc4ZDA5Zjdm
+./template-migrate.py import --in tpl.json --team-id 81e81bf9-151f-475c-b684-f4d84ab212e6 --host mysql-cn-north-1-0d172e202dfb4050.rds.jdcloud.com --db agentic_bidding --user ads_model_agent
+
+校验导入的模板数据：
+python3 template-migrate.py verify \
+    --in tpl.json \
+    --team-id 81e81bf9-151f-475c-b684-f4d84ab212e6 \
+    --host mysql-cn-north-1-0d172e202dfb4050.rds.jdcloud.com --db agentic_bidding --user ads_model_agent
+
+替换二进制：
+cp bin/arm64/api /usr/bin/api
+cp bin/arm64/client-proxy /usr/bin/client-proxy
+cp bin/arm64/orchestrator /usr/bin/orchestrator
+cp bin/arm64/envd /fc-envd/
+
+
+
+直接通过restful接口查询命令：
+curl --request GET --url 'http://6.176.76.129:3000/v2/sandboxes?order=desc&limit=100' --header 'X-API-Key: e2b_03ec1657fe0514e9a457200acf1cdcbde0bd36eb' | jq
+
+curl --request DELETE --url 'http://6.176.76.129:3000/sandboxes/iajzavk1i03ifzmuukouv' --header 'X-API-Key: e2b_03ec1657fe0514e9a457200acf1cdcbde0bd36eb' | jq
+
+
+
+拉起好mock的agent-proxy
+cd /home/KASandbox/KASandbox-node-discovery-dev/tests/discovery-stub
+GOWORK=off go build -o discovery-stub .
+vim config.example.json
+{
+  "instances": [
+    {"id": "wbff1537-5908-1ac0-e251-516cff24e4ee", "ip": "6.176.76.129", "port": 5008}
+  ]
+}
+GOWORK=off go run . -config config.example.json -addr :15080
+手动拉起所有服务
+cd /root/rpmbuild/BUILD/e2b-infra-2026.09/no-nomad
+修改start-api.sh
+export ORCHESTRATOR_TYPE="custom" # ← mock 生效关键
+export CUSTOM_URL="http://127.0.0.1:15080/instances"
+./start-all.sh
+
+
+e2b里redis代码修改（注释的是源代码，packages/shared/pkg/factories/redis.go）：
+ 77         case config.RedisURL != "":
+ 78                 // redisClient = redis.NewClient(&redis.Options{
+ 79                 //      Addr:         config.RedisURL,
+ 80                 //      MinIdleConns: 1,
+ 81                 // })
+ 82                 opts, err := redis.ParseURL(config.RedisURL)
+ 83                 if err != nil {
+ 84                         opts = &redis.Options{Addr: config.RedisURL}
+ 85                 }
+ 86                 opts.MinIdleConns = 1
+ 87                 redisClient = redis.NewClient(opts)
+ 
+ 
+/home/wbf/sandbox_shell.py
+
+编译：
+/home/KASandbox/KASandbox-node-discovery-dev
+./build.sh
+./build.sh -f
+
+
+沙箱pod依赖的组件，需要创建放置目录：
+mkdir -p /orchestrator/sandbox /orchestrator/template \
+         /orchestrator/build /orchestrator/build-templates
+mkdir -p /fc-vm /fc-kernels /fc-versions/v1.13.1 /fc-envd
+mkdir -p /mnt/snapshot-cache /tmp/templates
+cp /home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/api /usr/bin/api
+cp /home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/orchestrator /usr/bin/orchestrator
+cp /home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/client-proxy /usr/bin/client-proxy
+cp -r /home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/vmlinux-* /fc-kernels/
+cp /home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/firecracker /fc-versions/v1.13.1/firecracker
+cp /home/KASandbox/KASandbox-node-discovery-dev/bin/arm64/envd /fc-envd/envd
+
+登录沙箱脚本
+cd /home/wbf
+python3 sandbox_shell.py
+
+创建沙箱脚本
+cd /home/wbf
+python3 build_e2b.py
+
+
+也可以用这个命令，调的是内网部署的一个 llm 服务：
+
+curl -sS http://vobagent.llmserver.jd.local/v1/chat/completions -H "Content-Type: application/json" -d '{"model": "Qwen3-14B","messages": [{"role":"user","content":"用一句话介绍京东"}],"max_tokens": 64,"temperature": 0.7,"top_p": 0.8,"chat_template_kwargs": {"enable_thinking": false}}'
+
+预期 response：
+
+{
+  "id": "chatcmpl-904129d1c9bfec28",
+  "object": "chat.completion",
+  "created": 1789042501,
+  "model": "Qwen3-14B",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "京东是一家以电子商务为主，业务涵盖零售、物流、金融、科技等领域的中国大型综合型互联网企业。",
+        "refusal": null,
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": [],
+        "reasoning": null,
+        "reasoning_content": null
+      },
+      "logprobs": null,
+      "finish_reason": "stop",
+      "stop_reason": null,
+      "token_ids": null
+    }
+  ],
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "prompt_tokens": 16,
+    "total_tokens": 41,
+    "completion_tokens": 25,
+    "prompt_tokens_details": null
+  },
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "kv_transfer_params": null
+}
