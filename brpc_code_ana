@@ -1,0 +1,210 @@
+# brpc Client → Server 全流程代码清单
+
+> 基于 baidu_std 协议梳理，标注 `文件:行号` 便于跳转定位。
+> 工程根目录：`src/brpc/`
+
+---
+
+## 一、Client 端：发起 RPC
+
+### 1. `Channel::CallMethod` —— 入口
+`src/brpc/channel.cpp:482`
+
+- `cntl->OnRPCBegin` 记录开始时间（:489）
+- 继承 ChannelOptions：`timeout_ms / backup_request_ms / connection_type / max_retry / protocol`（:491-584）
+- 设置 `_pack_request` 函数指针（baidu_std 协议指向 `PackRpcRequest`）（:582）
+- **序列化请求**：`_serialize_request(&cntl->_request_buf, cntl, request)`（:597）
+- 设置超时/backup 定时器：`bthread_timer_add` → `HandleTimeout` / `HandleBackupRequest`（:631-652）
+- 调用 `cntl->IssueRPC(start_send_real_us)`（:657）
+- 同步 RPC：`Join(correlation_id)` 等响应，`OnRPCEnd`（:658-664）
+
+### 2. `Controller::IssueRPC` —— 选路 + 打包 + 发送
+`src/brpc/controller.cpp:1315`
+
+- 选择目标 server：
+  - 单点：`Socket::Address(_single_server_id, ...)`（:1364）
+  - 集群：`_lb->SelectServer(sel_in, &sel_out)`（LoadBalancer 选路）（:1377）
+- 处理连接类型：`GetPooledSocket` / `GetShortSocket` / 单连接（:1413-1456）
+- 认证：`sending_sock->FightAuthentication`（:1466-1480）
+- **打包请求**：`_pack_request(&packet, &user_packet, cid.value, _method, this, _request_buf, using_auth)`（:1484）
+- **写入 socket**：`_current_call.sending_sock->Write(&packet, &wopt)`（:1526）
+- `bthread_id_unlock(cid)`（:1543）
+
+### 3. `PackRpcRequest` —— 协议打包（baidu_std）
+`src/brpc/policy/baidu_rpc_protocol.cpp:1113`
+
+- 构造 `RpcMeta` + `RpcRequestMeta`（service_name / method_name / log_id / correlation_id / compress_type / content_type）（:1120-1191）
+- `SerializeRpcHeaderAndMeta(req_buf, meta, req_size + attached_size)`（:1199）
+  - 12 字节 header（"PRPC" + body_size + meta_size）：`baidu_rpc_protocol.cpp:83`
+- `req_buf->append(request_body)`；附加 attachment（:1200-1203）
+
+### 4. `Socket::Write` → `StartWrite`
+`src/brpc/socket.cpp:1643` / `:1723`
+
+- 构造 `WriteRequest`，CAS 推入 `_write_head` 链表（:1725-1734）
+- `ConnectIfNot` 建连（:1755）；异步则回调 `KeepWriteIfConnected`（:1554）
+- 同步写一次：`_conn->CutMessageIntoFileDescriptor`（:1781）
+- 未写完 → 启动 `KeepWrite` bthread（:1806）
+
+### 5. `Socket::KeepWrite` —— 后台写线程
+`src/brpc/socket.cpp:1824`
+
+- 循环 `s->DoWrite(req)`，处理 EAGAIN/EOVERCROWDED，直到队列清空
+
+---
+
+## 二、Server 端：接收与处理
+
+### 6. epoll 事件 → `Socket::OnInputEvent`
+`src/brpc/socket.cpp:2252`
+
+- `_nevent` 原子计数，去重后启动 bthread → `InputMessenger::OnNewMessages`
+
+### 7. `InputMessenger::OnNewMessages` —— 读 + 切分
+`src/brpc/input_messenger.cpp:103`
+
+- `m->DoRead(&processor.read_buf(), processor.OnceReadSize())`（:127）
+- `processor.ProcessNewMessage(...)`（:152）
+
+### 8. `InputMessengerProcessor::ProcessNewMessage`
+`src/brpc/input_messenger_processor.h:61` / `CutInputMessage`
+
+- 依次尝试各协议的 `parse` 函数；baidu_std → `ParseRpcMessage`
+- `ParseRpcMessage`：`src/brpc/policy/baidu_rpc_protocol.cpp:105`
+  - 校验 "PRPC" magic，解析 body_size / meta_size（:107-133）
+  - `source->cutn(&msg->meta, meta_size)` / `cutn(&msg->payload, body_size - meta_size)`（:143-144）
+  - 返回 `MostCommonMessage`
+- 调用协议 `process` → `ProcessRpcRequest`
+
+### 9. `ProcessRpcRequest` —— 协议层处理（baidu_std）
+`src/brpc/policy/baidu_rpc_protocol.cpp:599`
+
+- 解析 `RpcMeta` → `RpcRequestMeta`（:607-614）
+- 采样 `AskToBeSampled`（:616）
+- 新建 `Controller`，填充 `set_server / set_peer_id / set_remote_side / set_auth_context` 等（:628-659）
+- 链路追踪：`Span::CreateServerSpan`（:678）
+- **查找 Service/Method**：
+  - `IsBaiduMasterService` → `server->options().baidu_master_service`（:722-755）
+  - 否则 `FindMethodPropertyByFullName(svc_name, method_name)`（:770-812）
+- 并发限制：`method_status->OnRequested`（:803）
+- 反序列化请求：`DeserializeRpcMessage(req_buf, ..., messages->Request(), ...)`（:843）
+- 构造 `done = NewCallback(&SendRpcResponse, ...)`（:861-865）
+- **调用用户 Service**：`svc->CallMethod(method, cntl, req, res, done)`（:875）
+
+### 10. 用户业务逻辑 → `done->Run()`
+
+### 11. `SendRpcResponse` —— 发送响应
+`src/brpc/policy/baidu_rpc_protocol.cpp:288`
+
+- `SerializeResponse(*res, *cntl, res_body)`（:337）
+- 构造 `RpcMeta` + `RpcResponseMeta`（error_code / correlation_id / compress_type）（:354-405）
+- `SerializeRpcHeaderAndMeta(&res_buf, meta, ...)`（:408）
+- `res_buf.append(res_body)` + attachment（:409-413）
+- **写回 socket**：`Socket::Write(&res_buf, ...)`（429，流式则 `SendStreamData`）
+- 资源回收：`ConcurrencyRemover`、`CallAfterRpcResp`、归还 `RpcPBMessages`（:302-319）
+
+---
+
+## 三、Client 端：接收响应
+
+### 12. epoll → `OnNewMessages` → `ProcessNewMessage` → `ParseRpcMessage`
+（同步骤 6-8，process 指向 `ProcessRpcResponse`）
+
+### 13. `ProcessRpcResponse` —— 响应解析
+`src/brpc/policy/baidu_rpc_protocol.cpp:944`
+
+- 解析 `RpcMeta` → `RpcResponseMeta`（:947-953）
+- `bthread_id_lock(cid, &cntl)` 按 correlation_id 找回 Controller（:958）
+- 校验 socket 匹配（:972）
+- 处理 attachment：`cutn` body / `response_attachment().swap`（:1020-1031）
+- **反序列化响应**：`DeserializeRpcMessage(*res_buf_ptr, *cntl, ..., cntl->response(), ...)`（:1051）
+- `accessor.OnResponse(cid, saved_error)`（:1069）
+
+### 14. `Controller::OnVersionedRPCReturned` —— 重试/结束决策
+`src/brpc/controller.cpp:840`
+
+- 版本号校验，忽略过期回调（:844-870）
+- 判断重试：`_retry_policy->DoRetry(this)` 或 backup request（EBACKUPREQUEST）（:876-955）
+  - 重试 → `IssueRPC(gettimeofday_us())`（:955）
+  - backup → `new Call(&_current_call)` + `IssueRPC`（:909-912）
+- 结束 → `EndRPC(info)`（或新 bthread `RunEndRPC` → `EndRPC`）（:996-1005）
+
+### 15. `Controller::EndRPC` → 唤醒等待者
+
+- 执行 `done->Run()`（用户回调）
+- `bthread_id_unlock_and_destroy` 唤醒 `Join(cid)`
+- 回到 `Channel::CallMethod` 同步路径（:662-664）
+
+---
+
+## 四、全流程调用链总览
+
+```
+Channel::CallMethod                 [channel.cpp:482]
+  └─ Controller::IssueRPC           [controller.cpp:1315]
+       ├─ LoadBalancer::SelectServer
+       ├─ PackRpcRequest            [baidu_rpc_protocol.cpp:1113]
+       │    └─ SerializeRpcHeaderAndMeta  [:83]
+       └─ Socket::Write            [socket.cpp:1643]
+            └─ StartWrite          [socket.cpp:1723]
+                 └─ KeepWrite      [socket.cpp:1824]
+════════════════ 网络 ════════════════
+Socket::OnInputEvent               [socket.cpp:2252]
+  └─ InputMessenger::OnNewMessages [input_messenger.cpp:103]
+       └─ ProcessNewMessage        [input_messenger_processor.h:61]
+            ├─ ParseRpcMessage     [baidu_rpc_protocol.cpp:105]
+            └─ ProcessRpcRequest   [baidu_rpc_protocol.cpp:599]
+                 ├─ FindMethodPropertyByFullName
+                 ├─ DeserializeRpcMessage
+                 ├─ svc->CallMethod  (用户代码)
+                 └─ SendRpcResponse  [baidu_rpc_protocol.cpp:288]
+                      └─ Socket::Write
+════════════════ 网络 ════════════════
+ProcessRpcResponse                  [baidu_rpc_protocol.cpp:944]
+  └─ ControllerPrivateAccessor::OnResponse
+       └─ OnVersionedRPCReturned   [controller.cpp:840]
+            └─ EndRPC → done->Run() / Join 唤醒
+```
+
+---
+
+## 五、核心模块索引
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| Channel | `src/brpc/channel.cpp` | RPC 入口、配置继承、同步/异步调度 |
+| Controller | `src/brpc/controller.cpp` | IssueRPC、选路、重试/backup、EndRPC |
+| Socket | `src/brpc/socket.cpp` | 读写、连接管理、KeepWrite 写线程 |
+| InputMessenger | `src/brpc/input_messenger.cpp` | 读数据、切分协议消息 |
+| InputMessengerProcessor | `src/brpc/input_messenger_processor.h` | 调用各协议 parse/process |
+| baidu_rpc_protocol | `src/brpc/policy/baidu_rpc_protocol.cpp` | 打包/解析/处理 baidu_std 协议 |
+| Server | `src/brpc/server.cpp` | Service/Method 注册表、并发控制 |
+| LoadBalancer | `src/brpc/load_balancer.cpp` | 集群选路（RR/LB 等） |
+
+---
+
+## 六、关键数据结构
+
+- `RpcMeta`：协议元信息（correlation_id / compress_type / attachment_size / stream_settings / user_fields）
+  - `RpcRequestMeta`：service_name / method_name / log_id / timeout_ms / trace_id
+  - `RpcResponseMeta`：error_code / error_text
+- `Controller`：贯穿一次 RPC 的上下文（`_request_buf` / `_pack_request` / `_current_call` / `_lb` / `_done` / `_correlation_id`）
+- `Socket`：连接抽象（`_write_head` 写队列 / `fd_input_processor` 读处理 / `_correlation_id`）
+- `MostCommonMessage`：切分出的协议消息（`meta` IOBuf + `payload` IOBuf）
+- `MethodProperty`：Server 端方法描述（service / method / status / max_concurrency）
+- `CallId`（bthread_id_t）：版本化 correlation_id，用于同步等待与重试版本控制
+
+---
+
+## 七、协议报文格式（baidu_std）
+
+```
++--------+-----------+----------+------------------+------------------+
+| "PRPC" | body_size | meta_size|     RpcMeta      |    payload       |
+| 4 byte | 4 byte    | 4 byte   |   (protobuf)     |  (pb + attach)   |
++--------+-----------+----------+------------------+------------------+
+|<----------- 12 byte header ---------------------->|<-- body_size -->|
+```
+
+- `body_size = meta_size + payload_size`
+- `payload` = 序列化后的 request/response message + attachment
