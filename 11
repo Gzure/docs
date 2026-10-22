@@ -1,0 +1,785 @@
+
+brpc UrmaTransport 培训文档
+面向新人的架构、流程、模式详解。配合 docs/cn/urma.md 使用。
+
+1. 总体设计
+1.1 一句话概括
+UrmaTransport 是基于 openEuler URMA（Unified Remote Memory Access）SDK 实现的 brpc 传输层。它采用 双平面设计：控制面走 TCP（建链握手、回退），数据面走 URMA（零拷贝远程内存读写），在无 URMA 硬件时透明回退为 TCP。
+
+1.2 核心概念速览
+概念	说明
+URMA	openEuler 统一远程内存访问，提供 verbs 风格接口
+Jetty	URMA 的通信端点，类似 RDMA QP，含发送(JFS)和共享接收(JFR)
+JFC	完成队列(Jetty Completion Queue)，承载发送/接收完成事件
+JFCE	JFC 的事件 fd，用于 epoll 通知（Event 模式）
+JFR	共享接收队列，由 Jetty 的多个 JFS 共享
+Segment	注册的内存段，通过 urma_register_seg 一次性注册
+CTP	Connection Transport Path，当前使用的传输路径类型
+1.3 模块层次
+URMA SDK / 内核
+UrmaTransport 传输层
+brpc核心
+应用层
+urma_api.h
+post poll wait rearm
+urma_context_t
+device EID
+Jetty JFC JFR JFCE
+mmap + register_seg
+Buffer Pool
+UrmaTransport
+urma_transport.cpp
+TcpTransport
+回退路径
+UrmaEndpoint
+urma_endpoint.cpp
+UrmaHandshake
+urma_handshake.cpp
+UrmaHelper
+urma_helper.cpp
+Channel / Server
+Socket 生命周期管理
+InputMessenger 消息解析
+业务代码
+1.4 关键类职责
+owns
+owns
+uses
+creates
+drives handshake
+UrmaTransport
+-UrmaEndpoint* _urma_ep
+-atomic<UrmaState> _urma_state
+-shared_ptr<TcpTransport> _tcp_transport
++Init(socket, options)
++Connect()
++CutFromIOBuf(buf)
++CutFromIOBufList(bufs, n)
++WaitEpollOut(butex, pollin, duetime)
++ProcessEvent(attr)
++QueueMessage(msg, num, last)
+UrmaEndpoint
+-UrmaResource* _resource
+-State _state
+-atomic<uint16_t> _sq_window_size
+-atomic<uint16_t> _remote_rq_window_size
++CutFromIOBufList(data, n)
++IsWritable()
++AllocateResources()
++ImportPeer(hello)
++PostRecv(num, zerocopy)
++HandleCompletion(cr)
++PollCq(socket)
++OnNewDataFromTcp(socket)
+UrmaResource
++urma_jfc_t* jfc
++urma_jfce_t* jfce
++urma_jfr_t* jfr
++urma_jetty_t* jetty
++urma_target_jetty_t* remote_jetty
++urma_target_seg_t* remote_seg
+«interface»
+UrmaHandshake
++SendLocalHello()
++ReceiveAndParseRemoteHello(out, negotiated)
+UrmaConnect
++StartConnect(socket, done, data)
++StopConnect(socket)
+-Run()
+1.5 双窗口信用流控
+UrmaEndpoint 维护两个原子窗口变量来控制发送速率：
+
+完成回调
+接收方
+发送方
+是
+否
+SEND completion
+SQ++
+RECV completion
+含 imm_data
+收到数据
+处理完成
+SendImm credit
+SEND_IMM WR
+PostRecv 1
+重新投递接收 WR
+_sq_window_size
+本地 SQ 可用 WR 数
+_remote_rq_window_size
+对端 RQ 可用接收数
+SQ > 0
+且 RQ > 0?
+urma_post_jetty_send_wr
+SQ-- RQ--
+返回 EAGAIN
+调用方等 butex
+关键点：发送方在 urma_post_jetty_send_wr 之前就扣减两个窗口（源码 urma_endpoint.cpp:751-752），防止轮询模式下完成回调在 post 返回前就到达。
+
+2. 架构总览图
+URMA 内核对象
+完成事件获取
+数据面 URMA
+控制面 TCP
+Jetty JFS shared JFR
+JFC 完成队列
+JFCE 事件 fd
+JFR 接收队列
+remote_seg
+import_seg
+remote_jetty
+import_jetty
+Event 模式 --urma_use_polling=false
+JFCE fd 到 epoll 边沿触发
+到 PollCq
+Poll 模式 --urma_use_polling=true
+专用 bthread 轮询 JFC
+到 PollCq
+发送路径
+CutFromIOBufList
+到 urma_post_jetty_send_wr
+接收路径
+PollCq 到 HandleCompletion
+到 InputMessenger
+双窗口信用流控
+_sq_window_size
+_remote_rq_window_size
+内存管理
+mmap + register_seg
+IOBuf block 直接构建 SGE
+TCP fd
+epoll 生命周期管理
+握手状态机
+v2 二进制 v3 protobuf
+4字节 ACK
+透明回退 TCP
+3. 建链流程
+3.1 建链时序图（客户端→服务端）
+客户端 Channel
+UrmaEndpoint Client
+TCP fd
+UrmaEndpoint Server
+服务端 Server
+1. TCP 连接建立
+connect
+1
+TCP established
+2
+2. 客户端启动握手 bthread
+UrmaConnect StartConnect
+3
+bthread_start_background
+ProcessHandshakeAtClient
+4
+3. 双方分配 URMA 资源
+C_ALLOC_RES
+AllocateResources
+JFC JFCE JFR Jetty
+5
+PostRecv rq_size
+预投递接收 WR
+6
+4. 交换 Hello 消息
+C_HELLO_SEND
+FillLocalHello EID jetty_id
+seg recv_buffer_cnt
+7
+write URMA + HelloMessage 86B
+8
+读取 magic + hello
+9
+服务端收到 TCP 数据触发 OnNewDataFromTcp
+S_HELLO_WAIT
+ReadFromFd magic 4
+10
+CreateServerHandshakeByMagic
+URMA to V2
+11
+ReceiveAndParseRemoteHello
+12
+ValidHello 校验
+13
+5. 服务端分配资源 + 导入对端
+S_ALLOC_RES
+AllocateResources
+14
+PostRecv rq_size
+15
+ApplyRemoteHello
+设置窗口大小
+16
+S_IMPORT_PEER
+ImportPeer
+17
+关键顺序 import_seg 先于 import_jetty
+urma_import_seg peer_seg
+建立 TP 路由
+18
+urma_import_jetty peer_jetty
+19
+6. 服务端发送 Hello
+S_HELLO_SEND
+20
+write URMA + HelloMessage
+21
+读取 server hello
+22
+7. 客户端导入对端资源
+C_HELLO_WAIT 到 C_IMPORT_PEER
+23
+ApplyRemoteHello
+24
+urma_import_seg peer_seg
+25
+urma_import_jetty peer_jetty
+26
+8. ACK 确认
+C_ACK_SEND
+27
+write 0x00000001 4B ACK
+28
+S_ACK_WAIT 读取 ACK
+29
+9. URMA 建立
+urma_state = URMA_ON
+state = ESTABLISHED
+30
+urma_state = URMA_ON
+state = ESTABLISHED
+31
+done 0 data 连接就绪
+32
+TCP fd 仅用于 epoll 生命周期
+33
+客户端 Channel
+UrmaEndpoint Client
+TCP fd
+UrmaEndpoint Server
+服务端 Server
+3.2 握手状态机
+Client
+Server
+IsUrmaAvailable
+AllocateResources OK
+SendLocalHello OK
+negotiated true
+ImportPeer OK
+OnNewDataFromTcp
+magic URMA or URM3
+AllocateResources OK
+ImportPeer OK
+SendLocalHello OK
+client not available
+server magic mismatch
+negotiated false
+ACK no URMA_OK
+OnNewMessages
+WriteToFd ACK OK
+ACK and URMA_OK
+close
+UNINIT
+C_ALLOC_RES
+C_HELLO_SEND
+C_HELLO_WAIT
+C_IMPORT_PEER
+C_ACK_SEND
+ESTABLISHED
+DataSendRecv
+S_HELLO_WAIT
+S_ALLOC_RES
+S_IMPORT_PEER
+S_HELLO_SEND
+S_ACK_WAIT
+FALLBACK_TCP
+3.3 回退机制
+当对端不支持 URMA 时（如 TCP 客户端连接 URMA 服务端），在 4 字节 magic 握手阶段透明回退：
+
+是 服务端
+否
+是
+否
+是
+否
+是
+否
+是
+否
+是
+TCP fd 可读
+OnNewDataFromTcp
+state == UNINIT?
+IsUrmaAvailable?
+FALLBACK_TCP
+URMA_OFF
+启动 ServerHandshake bthread
+magic URMA or URM3?
+PushBackToReadBuf
+回退字节
+正常握手流程
+InputMessenger::OnNewMessages
+纯 TCP 处理
+state < ESTABLISHED?
+wake 握手 bthread
+state == FALLBACK_TCP?
+ESTABLISHED?
+排空 TCP 残留字节
+4. 业务流程
+4.1 发送流程
+用户调用
+Channel
+UrmaTransport
+UrmaEndpoint
+URMA SDK
+完成队列
+CallMethod
+1
+CutFromIOBufList data n
+2
+CutFromIOBufList data n
+3
+检查 sq_window_size 大于 0
+且 remote_rq_window_size 大于 0
+4
+构建 urma_sge_t
+从 IOBuf block refs
+零拷贝无需注册
+5
+remote_rq_window_size -= 1
+sq_window_size -= 1
+6
+urma_post_jetty_send_wr
+URMA_OPC_SEND
+7
+URMA_SUCCESS
+8
+sq_current = sq_current+1 mod sq_size-RESERVED
+9
+返回已发送字节 total_len
+10
+EAGAIN 到 WaitEpollOut
+11
+alt
+[窗口可用]
+[窗口为空]
+loop
+[每个 WR 受窗口限制]
+返回 total_len
+12
+tcp_transport CutFromIOBufList
+TCP 回退路径
+13
+alt
+[urma_state URMA_ON]
+[urma_state not URMA_ON]
+异步完成
+SEND completion
+14
+HandleCompletion via PollCq
+15
+sq_window_size += 1
+sq_sent = sq_sent+1 mod
+16
+若 remote_rq_window >= capacity/8
+WakeAsEpollOut
+17
+用户调用
+Channel
+UrmaTransport
+UrmaEndpoint
+URMA SDK
+完成队列
+4.2 接收流程
+URMA 硬件
+JFC 完成队列
+UrmaEndpoint
+InputMessenger
+用户 bthread
+预投递 PostRecv rq_size
+每个 WR 指向 pool buffer
+数据到达 RECV completion
+1
+PollCq drain_cq urma_poll_jfc
+2
+HandleCompletion cr
+3
+回收 SQ 窗口
+sq_window_size += 1
+4
+clear sbuf slot
+5
+WakeAsEpollOut 如有
+6
+remote_rq_window_size += acks
+7
+WakeAsEpollOut
+8
+alt
+[含 imm_data credit
+ACK]
+memcpy 到 read_buf 小包拷贝
+9
+cutn 到 read_buf 零拷贝
+10
+alt
+[completion_len 小于
+zerocopy_min_size]
+PostRecv 1 zerocopy
+重新投递接收 WR
+11
+SendAck 1
+累积到阈值后 SendImm
+12
+alt
+[cr 是 SEND completion
+s_r 0]
+[cr 是 RECV completion]
+DispatchReceivedBytes bytes
+13
+pending_received_bytes += bytes
+14
+ProcessNewMessage pending false
+15
+解析 baidu_std 协议
+16
+启动用户回调 bthread
+17
+暂存 握手完成后 DispatchReceivedBytes 触发
+alt
+[state ESTABLISHED]
+[握手未完成]
+URMA 硬件
+JFC 完成队列
+UrmaEndpoint
+InputMessenger
+用户 bthread
+4.3 内存管理流程
+发送零拷贝
+全局初始化
+用户注册内存
+urma_register_seg
+RegisterMemoryForUrma
+buf len
+返回 handle 非零
+append_user_data_with_meta
+meta = handle
+发送时 get_first_data_meta
+取出 tseg
+遍历 block refs
+IOBuf 数据
+GetPoolSegFor addr
+查 target_seg
+构建 urma_sge_t
+addr len tseg
+urma_post_jetty_send_wr
+无需逐消息注册
+urma_register_seg
+一次性注册
+mmap 大段内存
+切成固定 buffer
+默认 8KB
+劫持 IOBuf blockmem_allocate
+每个 block 来自注册段
+5. Poll 模式与 Event 模式
+UrmaTransport 支持两种完成事件获取方式，通过 --urma_use_polling 切换。
+
+5.1 模式对比
+Poll模式
+Event模式 (默认)
+是
+否
+是
+否
+处理 CqSidOp 队列
+ADD/REMOVE
+专用 bthread 循环
+遍历所有 cq_sid
+调用 PollCq
+drain_cq
+urma_poll_jfc
+HandleCompletion
+DispatchReceivedBytes
+callback?
+yield 或
+cq_sids 为空?
+bthread_yield
+epoll 边沿触发
+JFCE fd 可读
+PollCq 回调
+WaitCqEvent
+urma_wait_jfc
+drain_cq
+urma_poll_jfc
+ack + rearm
+urma_ack_jfc + urma_rearm_jfc
+ReqNotifyCq
+再次 arm
+DispatchReceivedBytes
+MoreReadEvents?
+退出 PollCq
+5.2 Event 模式时序图（默认：--urma_use_polling=false）
+EventDispatcher epoll
+JFCE fd
+PollCq
+JFC poll
+UrmaEndpoint
+InputMessenger
+URMA
+AllocateResources 时:
+创建 JFCE 用 JFCE.fd 创建 Socket
+设置 on_edge_triggered = PollCq
+ReqNotifyCq urma_rearm_jfc
+完成事件到达
+1
+fd 可读 边沿触发
+2
+PollCq cq_socket
+3
+Socket::Address ep socket
+4
+WaitCqEvent urma_wait_jfc jfce 1
+5
+drain_cq loop urma_poll_jfc jfc n crs
+6
+cnt 个完成记录
+7
+HandleCompletion cr
+8
+bytes received
+9
+loop
+[每个 cr]
+urma_ack_jfc event_jfc nevents 1
+10
+ReqNotifyCq urma_rearm_jfc jfc false
+11
+再次 drain_cq 关闭竞态窗口
+12
+DispatchReceivedBytes s bytes
+13
+ProcessNewMessage
+14
+MoreReadEvents?
+15
+继续 WaitCqEvent
+16
+退出 PollCq
+17
+alt
+[有更多事件]
+[无]
+alt
+[event_count > 0]
+[event_count == 0]
+loop
+[PollCq 主循环]
+EventDispatcher epoll
+JFCE fd
+PollCq
+JFC poll
+UrmaEndpoint
+InputMessenger
+URMA
+Event 模式特点：
+
+由 epoll 驱动，JFCE fd 可读时才调用 PollCq
+每轮先 urma_wait_jfc 消费事件，再 urma_poll_jfc 排空 CQ
+drain 后 urma_ack_jfc + urma_rearm_jfc 重新 arm
+二次 drain 关闭 drain/rearm 竞态窗口
+空闲时不消耗 CPU
+5.3 Poll 模式时序图（--urma_use_polling=true）
+应用启动
+GlobalInitialize
+PollerGroup
+Poller bthread
+CqSidOp 队列
+UrmaEndpoint
+PollCq
+JFC poll
+启动阶段
+ContextInitOrDie
+1
+GlobalUrmaInitializeOrDie
+2
+InitPollingModeWithTag tag
+3
+创建 PollerGroup ntags
+每个 group 含 poller_num 个 Poller
+4
+bthread_start_background UrmaPolling
+5
+轮询主循环
+Dequeue CqSidOp
+6
+cq_sids.emplace sid
+7
+cq_sids.erase sid
+8
+alt
+[ADD]
+[REMOVE]
+Socket::Address sid
+9
+PollCq s
+10
+Poll 模式下 event_mode false
+drain_cq loop urma_poll_jfc jfc n crs
+11
+cnt 个完成记录
+12
+HandleCompletion cr
+13
+loop
+[每个 cr]
+DispatchReceivedBytes s bytes
+14
+返回 无 event 循环
+15
+alt
+[成功]
+loop
+[遍历 cq_sids]
+callback 如有
+16
+bthread_yield
+17
+alt
+[urma_polle-
+r_yield 或
+cq_sids
+为空]
+loop
+[while running]
+连接建立时
+AllocateResources
+18
+创建合成 Socket 无 fd
+PollerAddCqSid fmix32 cq_sid pct poller_num Enqueue ADD
+19
+连接关闭时
+PollerRemoveCqSid Enqueue REMOVE
+20
+应用启动
+GlobalInitialize
+PollerGroup
+Poller bthread
+CqSidOp 队列
+UrmaEndpoint
+PollCq
+JFC poll
+Poll 模式特点：
+
+每个 bthread tag 启动 --urma_poller_num 个专用 bthread
+每个 Poller 负责一组 CQ SocketId（hash 分配）
+bthread 不停 urma_poll_jfc，不依赖 epoll / JFCE
+无系统调用开销，延迟最低（适合极致性能场景）
+空闲时通过 bthread_yield 让出 CPU
+--urma_disable_bthread 可使消息处理内联在 Poller bthread 中
+5.4 两种模式对比
+对比
+Event 模式
+--urma_use_polling=false
+(默认)
+Poll 模式
+--urma_use_polling=true
+触发方式: epoll 边沿
+依赖: JFCE fd
+空闲时: 不消耗 CPU
+延迟: 有 epoll 唤醒开销
+每连接: 多一个 fd
+适用: 一般场景
+连接数多 / CPU 敏感
+触发方式: bthread 主动轮询
+依赖: 无 fd, 合成 Socket
+空闲时: 消耗 CPU / bthread_yield
+延迟: 无唤醒开销, 最低
+每连接: 不占 fd
+适用: 极致性能场景
+连接数可控 / 专用核
+维度	Event 模式（默认）	Poll 模式
+触发方式	epoll 边沿触发 (JFCE fd)	专用 bthread 轮询 JFC
+文件描述符	每连接额外 1 个 fd (JFCE)	无额外 fd (合成 Socket)
+空闲 CPU	不消耗	持续轮询，可 --urma_poller_yield 让出
+唤醒延迟	有 epoll 唤醒开销	无唤醒开销，延迟最低
+PollCq 逻辑	wait_jfc → poll_jfc → ack → rearm → 再 drain	直接 poll_jfc → HandleCompletion
+配置	默认	--urma_use_polling=true --urma_poller_num=N
+适用场景	通用场景，连接数多	极致延迟，专用核，连接数可控
+5.5 QueueMessage 行为差异
+两种模式在消息分发路径上也有差异（urma_transport.cpp:158-184）：
+
+是 Event 模式
+否 Poll 模式
+是
+否
+是
+否
+QueueMessage
+last_msg 且
+非 Poll 模式?
+直接返回
+由 PollCq 的 epoll 边沿
+驱动下一轮
+urma_disable_bthread?
+内联处理
+ProcessInputMessage
+usercode_in_pthread?
+BTHREAD_ATTR_PTHREAD
+启动 bthread
+BTHREAD_ATTR_NORMAL
+启动 bthread
+++num_bthread_created
+6. 完整生命周期总结
+Event
+Poll
+进程启动
+ContextInitOrDie
+GlobalUrmaInitializeOrDie
+init device context EID seg
+GlobalInitialize
+预创建 Jetty Pool
+Poll 模式: 创建 PollerGroup
+新连接建立
+TCP connect 完成
+启动握手 bthread
+AllocateResources
+从 Pool 取或新建
+JFC JFCE JFR Jetty
+Poll 模式?
+用 JFCE.fd 创建 Socket
+设置 PollCq 回调
+ReqNotifyCq
+创建合成 Socket
+PollerAddCqSid
+PostRecv 预投递
+交换 Hello + ACK
+ImportPeer
+import_seg 然后 import_jetty
+ESTABLISHED
+URMA_ON
+数据收发
+发送: CutFromIOBufList
+接收: PollCq 然后 HandleCompletion
+连接关闭
+DeallocateResources
+PollerRemoveCqSid
+销毁 CQ Socket
+销毁 Resource
+资源回收
+进程退出
+GlobalRelease
+释放 Pool
+PollingModeRelease
+7. 关键配置速查
+Flag	默认	影响范围	说明
+--urma_use_polling	false	完成事件	false=Event(epoll), true=Poll(bthread轮询)
+--urma_poller_num	1	Poll 模式	每个 bthread tag 的轮询器数量
+--urma_disable_bthread	false	消息分发	true=内联处理, 不起 bthread
+--urma_sq_size	128	发送队列	本地 JFS 深度 [16, 4096]
+--urma_rq_size	128	接收队列	本地 JFR 深度 [16, 4096]
+--urma_cqe_poll_once	32	每次 poll	每次 urma_poll_jfc 上限
+--urma_recv_zerocopy	true	接收路径	大包零拷贝
+--urma_zerocopy_min_size	512	接收路径	小于此值走拷贝
+--urma_buffer_size	8192	内存池	每个 buffer 大小
+--urma_buffer_count	65536	内存池	buffer 数量
+--urma_prepared_jetty_cnt	8	建链加速	预创建 Jetty 数
+--urma_poller_yield	false	Poll 模式	空闲时 bthread_yield
+--urma_client_handshake_version	2	握手协议	2=二进制, 3=protobuf
